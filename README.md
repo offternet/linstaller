@@ -1,3 +1,13 @@
+# ALPHA CONCEPT WARNING - Heavy Update June 08, 2026
+
+This repository contains experimental installer design code. It is not production ready. Do not run this on daily-use systems, production systems, or machines containing important data.
+
+Testing should be limited to virtual machines, disposable test drives, Raspberry Pi test systems, or other non-critical environments.
+
+The purpose of this fork is to explore a browser-driven, modular Linux installation model using HTML/JavaScript frontend concepts and local Linux command execution.
+
+======================================================================
+
 # linstaller
 A minimalistic, universal, easy-to-implement Linux installer
 
