@@ -1,214 +1,893 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# =============================================================================
+# LinStaller ALPHA Concept Rewrite
+# =============================================================================
+#
+# WARNING:
+#   This is ALPHA concept code.
+#   Do NOT use on production systems or daily-use machines.
+#   Recommended testing only:
+#       - Virtual Machines
+#       - Raspberry Pi test systems
+#       - disposable USB drives
+#       - non-critical test partitions
+#
+# Purpose:
+#   Install a Linux filesystem payload directly to a target partition.
+#
+# Core idea:
+#   filesystem.squashfs/root payload
+#       -> target partition
+#       -> fstab
+#       -> user setup
+#       -> locale/timezone/keyboard
+#       -> GRUB
+#       -> reboot
+#
+# This script is inspired by the original LinStaller concept but rewritten for:
+#   - safer validation
+#   - clearer modular sections
+#   - UUID-based fstab
+#   - better EFI handling
+#   - better cleanup
+#   - future RiteBrowser/Tuxamares integration
+#
+# =============================================================================
+
+
+# =============================================================================
+# 00. Global defaults
+# =============================================================================
+
+MESSAGE_FILE="${MESSAGE_FILE:-/dev/stderr}"
 
 DONT_UMOUNT=false
+DRY_RUN=false
+FORMAT_TARGET=false
+FORMAT_HOME=false
+I_UNDERSTAND=false
 
-[ -z "${MESSAGE_FILE}" ] && MESSAGE_FILE="/dev/stderr"
-echo -n >"${MESSAGE_FILE}"
+TARGET_MNT="/target"
 
-function log() {
-  echo "${1}" >> "${MESSAGE_FILE}"
+DEFAULT_TARGET_FS="ext4"
+DEFAULT_HOME_FS="ext4"
+
+target_partition=""
+home_partition=""
+efi_partition=""
+target_disk=""
+squashfs_file=""
+
+language=""
+keyboard_map=""
+timezone=""
+hostname=""
+user_name=""
+user_password=""
+user_password_file=""
+
+config_file=""
+
+echo -n > "$MESSAGE_FILE"
+
+
+# =============================================================================
+# 01. Logging helpers
+# =============================================================================
+
+log() {
+    echo "$1" | tee -a "$MESSAGE_FILE" >/dev/null
 }
 
-function install_grub() {
-  if [ -d "/sys/firmware/efi" ]; then
-    mkdir -p /target/efi
-    mount -o rw "${efi_partition}" /target/efi
-    chroot /target grub-install --force --removable --efi-directory=/efi --bootloader-id=GRUB "${target_disk}" || {
-      log "Fail when installing GRUB on ${target_partition} with EFI, exit code: ${?}"
-      exit 4
-    }
-    # Fallback for some VMs
-    grub-install --force --bootloader-id=GRUB --boot-directory=/target/boot/ --efi-directory=/target/efi
-  else
-    chroot /target grub-install --force "${target_disk}" || {
-      log "Fail when installing GRUB on ${target_partition} with Legacy BIOS, exit code: ${?}"
-      exit 4
-    }
-  fi
-  
-  chroot /target update-grub || {
-      log "Fail when updating GRUB on ${target_partition}, exit code: ${?}"
-      exit 5
-  }
-}
- 
-function install_system() {
-  log "Ensuring partitions are unmounted before installation..."
-  umount -l "${efi_partition}"    >> "${MESSAGE_FILE}" 2>&1
-  umount -l "${target_partition}" >> "${MESSAGE_FILE}" 2>&1
-  umount -l "${home_partition}"   >> "${MESSAGE_FILE}" 2>&1
-  umount -l "${target_disk}"      >> "${MESSAGE_FILE}" 2>&1
-  umount -l /target > /dev/null 2>&1
-  umount -l /target/home > /dev/null 2>&1
-
-  log "Mounting /target..."
-  mkdir -p "/target"
-  mount -o rw "${target_partition}" /target || {
-    log "Fail when trying to mount ${target_partition} in read-write mode in /target, exit code: ${?}"
-    exit 1
-  }
-  
-  [ -b "/${home_partition}" ] && {
-    log "Mounting /target/home..."
-    rm -rf "/target/home"
-    mkdir -p "/target/home"
-    mount -o rw "${home_partition}" /target/home || {
-      log "Fail when trying to mount ${home_partition} in read-write mode in /target/home, exit code: ${?}"
-      exit 2
-    }
-  }
- 
-  log "Extracting the system..."
-  [ -n "${squashfs_file}" ] && {
-    unsquashfs -f -d /target "${squashfs_file}" || {
-      log "Fail when extracting ${squashfs_file} to /target, exit code: ${?}"
-      exit 3
-    }
-  }
-  
-  log "Generating fstab"
-  mount | grep "${target_partition}" | sed 's| on /target | / |;s|type ||; s|(.*| rw 0 1|'          > /target/etc/fstab
-  mount | grep "${home_partition}"   | sed 's| on /target/home | /home |;s|type ||; s|(.*| rw 0 1|' >> /target/etc/fstab
- 
-  log "Installing GRUB"
-  mount -o bind /proc /target/proc
-  mount -o bind /sys  /target/sys
-  mount -o bind /dev  /target/dev
-  mkdir -p /target/tmp
-  chmod 1777 /target/tmp
-
-  install_grub
-  
-  # HOTFIX: update-grub taking wrong UUID of root partition
-  #(
-    cd /target/boot/grub
-    wrong_uuid=$(grep -om1 "root=UUID=.*" "grub.cfg" | cut -d ' ' -f1 | cut -d '=' -f3)
-    correct_uuid=$(blkid -o value -s UUID "${target_partition}")
-    
-    sed -i "s|${wrong_uuid}|${correct_uuid}|g" "grub.cfg"
-    
-    install_grub > /dev/null 2>&1
-  #)
- 
-  log "Setting up language..."
-  echo "LANG=${language}.UTF-8"   >  /target/etc/default/locale
-  echo "LC_ALL=${language}.UTF-8" >> /target/etc/default/locale
-  
-  log "Setting up keyboard..."
-  echo "KEYMAP=${keyboard_map}" > /target/etc/vconsole.conf
- 
-  log "Setting up timezone..."
-  ln -sf "/usr/share/zoneinfo/${timezone}" /target/etc/localtime
-  echo "${timezone}" > /target/etc/timezone
- 
-  log "Setting up hostname..."
-  echo "${hostname}" > /target/etc/hostname
- 
-  log "Setting up user..."
-  chroot /target useradd -m -s /bin/bash "${user_name}"
-  chroot /target usermod -aG sudo "${user_name}"
-  echo -e "${user_password}\n${user_password}" | chroot /target passwd "${user_name}"
- 
-  log "Running post install"
-  [ -f "/target/usr/bin/post-install" ] && {
-    chroot /target /usr/bin/post-install "${@}"
-  }
-
-  log "Install finished"
-  
-  exit 0
+die() {
+    log "ERROR: $1"
+    exit "${2:-1}"
 }
 
-function cleanup(){
-  [ "${DONT_UMOUNT}" = "true" ] && return ;
+run_cmd() {
+    log "RUN: $*"
 
-  log "Cleaning up..."
-  umount -l /target/proc
-  umount -l /target/sys
-  umount -l /target/dev
-  
-  [ -d "/sys/firmware/efi" ] && {
-    umount -l /target/efi && {
-      rm -rf /target/efi
-    }
-  }
-  
-  [ -b "/${home_partition}" ] && {
-    umount -l /target/home
-  }
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return 0
+    fi
 
-  umount -l "${target_partition}" >> "${MESSAGE_FILE}" 2>&1
-  umount -l "${home_partition}"   >> "${MESSAGE_FILE}" 2>&1
-  umount -l "${efi_partition}"    >> "${MESSAGE_FILE}" 2>&1
+    "$@" >> "$MESSAGE_FILE" 2>&1
+}
+
+run_shell() {
+    log "RUN: $*"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        return 0
+    fi
+
+    bash -c "$*" >> "$MESSAGE_FILE" 2>&1
+}
+
+
+# =============================================================================
+# 02. Usage
+# =============================================================================
+
+usage() {
+cat <<'EOF'
+LinStaller ALPHA Concept Rewrite
+
+WARNING:
+  Alpha concept only. Test in VM / Raspberry Pi / disposable systems.
+
+Required:
+  --target-partition=/dev/sdXN
+  --target-disk=/dev/sdX
+  --squashfs=/path/to/filesystem.squashfs
+  --user-name=username
+  --hostname=hostname
+  --timezone=America/Phoenix
+  --language=en_US
+  --keyboard-map=us
+  --i-understand-this-erases-target
+
+Password options:
+  --user-password='password'
+  OR
+  --user-password-file=/path/to/password-file
+
+EFI systems require:
+  --efi-partition=/dev/sdXN
+
+Optional:
+  --home-partition=/dev/sdXN
+  --format-target
+  --format-home
+  --target-fs=ext4
+  --home-fs=ext4
+  --skip-umount
+  --dry-run
+  --config=/path/to/install-plan.conf
+
+Example BIOS:
+  sudo ./linstaller-alpha.sh \
+    --target-partition=/dev/sda9 \
+    --target-disk=/dev/sda \
+    --squashfs=/home/linux/filesystem.squashfs \
+    --user-name=linux \
+    --user-password='password' \
+    --hostname=linstaller-test \
+    --timezone=America/Phoenix \
+    --language=en_US \
+    --keyboard-map=us \
+    --format-target \
+    --i-understand-this-erases-target
+
+Example EFI:
+  sudo ./linstaller-alpha.sh \
+    --target-partition=/dev/sda9 \
+    --target-disk=/dev/sda \
+    --efi-partition=/dev/sda1 \
+    --squashfs=/home/linux/filesystem.squashfs \
+    --user-name=linux \
+    --user-password='password' \
+    --hostname=linstaller-test \
+    --timezone=America/Phoenix \
+    --language=en_US \
+    --keyboard-map=us \
+    --format-target \
+    --i-understand-this-erases-target
+
+EOF
+}
+
+
+# =============================================================================
+# 03. Load config file
+#
+# Future RiteBrowser/Tuxamares direction:
+#   HTML/JS form writes install-plan.conf
+#   This script reads install-plan.conf
+#
+# Example config:
+#   target_partition="/dev/sda9"
+#   target_disk="/dev/sda"
+#   efi_partition="/dev/sda1"
+#   squashfs_file="/home/RiteClone/downloads/filesystem.squashfs"
+#   user_name="linux"
+#   user_password_file="/home/RiteClone/tmp/user-pass"
+#   hostname="linstaller"
+#   timezone="America/Phoenix"
+#   language="en_US"
+#   keyboard_map="us"
+#   FORMAT_TARGET=true
+#   I_UNDERSTAND=true
+# =============================================================================
+
+load_config_file() {
+    local file="$1"
+
+    [[ -f "$file" ]] || die "Config file not found: $file" 42
+
+    log "Loading config file: $file"
+
+    # ALPHA NOTE:
+    # This sources a local trusted config file.
+    # For public release, replace with a stricter key=value parser.
+    # For current VM/Raspberry Pi testing, this is acceptable and simple.
+    # shellcheck disable=SC1090
+    source "$file"
+}
+
+
+# =============================================================================
+# 04. Parse arguments
+# =============================================================================
+
+parse_args() {
+    while [[ "$#" -gt 0 ]]; do
+        case "$1" in
+            --config=*)
+                config_file="${1#*=}"
+                ;;
+            --target-partition=*)
+                target_partition="${1#*=}"
+                ;;
+            --home-partition=*)
+                home_partition="${1#*=}"
+                ;;
+            --efi-partition=*)
+                efi_partition="${1#*=}"
+                ;;
+            --target-disk=*)
+                target_disk="${1#*=}"
+                ;;
+            --squashfs=*)
+                squashfs_file="${1#*=}"
+                ;;
+            --user-name=*)
+                user_name="${1#*=}"
+                ;;
+            --user-password=*)
+                user_password="${1#*=}"
+                ;;
+            --user-password-file=*)
+                user_password_file="${1#*=}"
+                ;;
+            --hostname=*)
+                hostname="${1#*=}"
+                ;;
+            --timezone=*)
+                timezone="${1#*=}"
+                ;;
+            --language=*)
+                language="${1#*=}"
+                ;;
+            --keyboard-map=*)
+                keyboard_map="${1#*=}"
+                ;;
+            --target-fs=*)
+                DEFAULT_TARGET_FS="${1#*=}"
+                ;;
+            --home-fs=*)
+                DEFAULT_HOME_FS="${1#*=}"
+                ;;
+            --format-target)
+                FORMAT_TARGET=true
+                ;;
+            --format-home)
+                FORMAT_HOME=true
+                ;;
+            --skip-umount)
+                DONT_UMOUNT=true
+                ;;
+            --dry-run)
+                DRY_RUN=true
+                ;;
+            --i-understand-this-erases-target)
+                I_UNDERSTAND=true
+                ;;
+            --help|-h)
+                usage
+                exit 0
+                ;;
+            *)
+                die "Unknown option: $1" 42
+                ;;
+        esac
+
+        shift
+    done
+
+    if [[ -n "$config_file" ]]; then
+        load_config_file "$config_file"
+    fi
+}
+
+
+# =============================================================================
+# 05. Validation
+# =============================================================================
+
+is_efi_booted() {
+    [[ -d "/sys/firmware/efi" ]]
+}
+
+current_root_source() {
+    findmnt -n -o SOURCE / 2>/dev/null
+}
+
+validate_required_values() {
+    [[ "$(id -u)" -eq 0 ]] || die "This script must be run as root." 42
+
+    [[ -n "$target_partition" ]] || die "Missing target partition." 42
+    [[ -n "$target_disk" ]]      || die "Missing GRUB target disk." 42
+    [[ -n "$squashfs_file" ]]    || die "Missing system image file." 42
+    [[ -n "$language" ]]         || die "Missing language." 42
+    [[ -n "$keyboard_map" ]]     || die "Missing keyboard map." 42
+    [[ -n "$timezone" ]]         || die "Missing timezone." 42
+    [[ -n "$hostname" ]]         || die "Missing hostname." 42
+    [[ -n "$user_name" ]]        || die "Missing user name." 42
+
+    if [[ -z "$user_password" && -z "$user_password_file" ]]; then
+        die "Missing user password or user password file." 42
+    fi
+
+    if is_efi_booted; then
+        [[ -n "$efi_partition" ]] || die "EFI boot detected, but missing EFI partition." 42
+    fi
+
+    [[ -b "$target_partition" ]] || die "Target partition is not a block device: $target_partition" 42
+    [[ -b "$target_disk" ]]      || die "Target disk is not a block device: $target_disk" 42
+    [[ -f "$squashfs_file" ]]    || die "SquashFS file not found: $squashfs_file" 42
+
+    if [[ -n "$home_partition" ]]; then
+        [[ -b "$home_partition" ]] || die "Home partition is not a block device: $home_partition" 42
+    fi
+
+    if is_efi_booted; then
+        [[ -b "$efi_partition" ]] || die "EFI partition is not a block device: $efi_partition" 42
+    fi
+
+    if [[ "$I_UNDERSTAND" != "true" ]]; then
+        die "Refusing to continue without --i-understand-this-erases-target" 42
+    fi
+}
+
+validate_not_current_root() {
+    local root_src
+    root_src="$(current_root_source)"
+
+    log "Current running root source: $root_src"
+    log "Selected target partition: $target_partition"
+
+    if [[ "$root_src" == "$target_partition" ]]; then
+        die "Refusing to install onto the currently running root partition: $target_partition" 99
+    fi
+}
+
+validate_target_disk_parent() {
+    local parent_disk
+    parent_disk="/dev/$(lsblk -no PKNAME "$target_partition" 2>/dev/null | head -n1)"
+
+    log "Detected parent disk for target partition: $parent_disk"
+    log "User-selected target disk: $target_disk"
+
+    if [[ "$parent_disk" != "$target_disk" ]]; then
+        log "WARNING: target disk does not match detected parent disk."
+        log "This may be valid on unusual systems, but verify carefully."
+    fi
+}
+
+validate_space_hint() {
+    local target_size
+    local squash_size
+
+    target_size="$(blockdev --getsize64 "$target_partition" 2>/dev/null || echo 0)"
+    squash_size="$(stat -c%s "$squashfs_file" 2>/dev/null || echo 0)"
+
+    log "Target partition bytes: $target_size"
+    log "SquashFS file bytes: $squash_size"
+
+    if [[ "$target_size" -le "$squash_size" ]]; then
+        log "WARNING: target partition may be too small."
+        log "SquashFS compressed size is smaller than extracted size, so target must be much larger."
+    fi
+}
+
+
+# =============================================================================
+# 06. Partition table refresh
+# =============================================================================
+
+refresh_partition_table() {
+    log "Refreshing partition tables..."
+
+    run_cmd partprobe "$target_disk"
+    run_cmd partx -u "$target_disk"
+
+    if [[ -n "$efi_partition" ]]; then
+        local efi_disk
+        efi_disk="/dev/$(lsblk -no PKNAME "$efi_partition" 2>/dev/null | head -n1)"
+        [[ -b "$efi_disk" ]] && run_cmd partprobe "$efi_disk"
+        [[ -b "$efi_disk" ]] && run_cmd partx -u "$efi_disk"
+    fi
+
+    if [[ -n "$home_partition" ]]; then
+        local home_disk
+        home_disk="/dev/$(lsblk -no PKNAME "$home_partition" 2>/dev/null | head -n1)"
+        [[ -b "$home_disk" ]] && run_cmd partprobe "$home_disk"
+        [[ -b "$home_disk" ]] && run_cmd partx -u "$home_disk"
+    fi
+}
+
+
+# =============================================================================
+# 07. Unmount helpers
+# =============================================================================
+
+umount_if_mounted_target_path() {
+    local path="$1"
+
+    if findmnt -rn "$path" >/dev/null 2>&1; then
+        log "Unmounting mounted path: $path"
+        run_cmd umount -l "$path"
+    fi
+}
+
+umount_device_everywhere() {
+    local dev="$1"
+
+    [[ -n "$dev" ]] || return 0
+    [[ -b "$dev" ]] || return 0
+
+    local mounts
+    mounts="$(findmnt -rn -S "$dev" -o TARGET 2>/dev/null || true)"
+
+    if [[ -n "$mounts" ]]; then
+        while IFS= read -r mnt; do
+            [[ -n "$mnt" ]] || continue
+            log "Unmounting $dev from $mnt"
+            run_cmd umount -l "$mnt"
+        done <<< "$mounts"
+    fi
+}
+
+
+# =============================================================================
+# 08. Cleanup
+# =============================================================================
+
+cleanup() {
+    [[ "$DONT_UMOUNT" == "true" ]] && return 0
+
+    log "Cleaning up..."
+
+    umount_if_mounted_target_path "$TARGET_MNT/boot/efi"
+    umount_if_mounted_target_path "$TARGET_MNT/run"
+    umount_if_mounted_target_path "$TARGET_MNT/dev/pts"
+    umount_if_mounted_target_path "$TARGET_MNT/dev"
+    umount_if_mounted_target_path "$TARGET_MNT/proc"
+    umount_if_mounted_target_path "$TARGET_MNT/sys"
+    umount_if_mounted_target_path "$TARGET_MNT/home"
+    umount_if_mounted_target_path "$TARGET_MNT"
+
+    if [[ -n "$home_partition" ]]; then
+        umount_device_everywhere "$home_partition"
+    fi
+
+    if [[ -n "$efi_partition" ]]; then
+        umount_device_everywhere "$efi_partition"
+    fi
+
+    umount_device_everywhere "$target_partition"
 }
 
 trap cleanup EXIT
 
-for arg in "${@}"; do
-  if echo "${arg}" | grep -q "^--target-partition="; then
-    target_partition=$(echo "${arg}" | sed 's|^--target-partition=||')
-    shift
-  elif echo "${arg}" | grep -q "^--home-partition="; then
-    home_partition=$(echo "${arg}" | sed 's|^--home-partition=||')
-    shift
-  elif echo "${arg}" | grep -q "^--user-name="; then
-    user_name=$(echo "${arg}" | sed 's|^--user-name=||')
-    shift
-  elif echo "${arg}" | grep -q "^--user-password="; then
-    user_password=$(echo "${arg}" | sed 's|^--user-password=||')
-    shift
-  elif echo "${arg}" | grep -q "^--squashfs="; then
-    squashfs_file=$(echo "${arg}" | sed 's|^--squashfs=||')
-    shift
-  elif echo "${arg}" | grep -q "^--hostname="; then
-    hostname=$(echo "${arg}" | sed 's|^--hostname=||')
-    shift
-  elif echo "${arg}" | grep -q "^--timezone="; then
-    timezone=$(echo "${arg}" | sed 's|^--timezone=||')
-    shift
-  elif echo "${arg}" | grep -q "^--keyboard-map="; then
-    keyboard_map=$(echo "${arg}" | sed 's|^--keyboard-map=||')
-    shift
-  elif echo "${arg}" | grep -q "^--target-disk="; then
-    target_disk=$(echo "${arg}" | sed 's|^--target-disk=||')
-    shift
-  elif echo "${arg}" | grep -q "^--efi-partition="; then
-    efi_partition=$(echo "${arg}" | sed 's|^--efi-partition=||')
-    shift
-  elif echo "${arg}" | grep -q "^--language="; then
-    language=$(echo "${arg}" | sed 's|^--language=||')
-    shift
-  elif echo "${arg}" | grep -q "^--skip-umount$"; then
-    DONT_UMOUNT=true
-    shift
-  fi
-done
 
-[ -z "${target_partition}" ] && { echo "Missing target partition";  exit 42; }
-[ -z "${target_disk}" ]      && { echo "Missing GRUB target disk";  exit 42; }
+# =============================================================================
+# 09. Optional formatting
+# =============================================================================
 
-[ -d "/sys/firmware/efi" ] && {
-  [ -z "${efi_partition}" ]  && { echo "Missing GRUB target disk";  exit 42; }
+format_partitions_if_requested() {
+    if [[ "$FORMAT_TARGET" == "true" ]]; then
+        log "Formatting target partition: $target_partition as $DEFAULT_TARGET_FS"
+
+        case "$DEFAULT_TARGET_FS" in
+            ext4)
+                run_cmd mkfs.ext4 -F "$target_partition"
+                ;;
+            ext3)
+                run_cmd mkfs.ext3 -F "$target_partition"
+                ;;
+            ext2)
+                run_cmd mkfs.ext2 -F "$target_partition"
+                ;;
+            btrfs)
+                run_cmd mkfs.btrfs -f "$target_partition"
+                ;;
+            *)
+                die "Unsupported target filesystem for formatting: $DEFAULT_TARGET_FS" 43
+                ;;
+        esac
+    else
+        log "FORMAT_TARGET=false. Target partition will not be formatted."
+    fi
+
+    if [[ -n "$home_partition" && "$FORMAT_HOME" == "true" ]]; then
+        log "Formatting home partition: $home_partition as $DEFAULT_HOME_FS"
+
+        case "$DEFAULT_HOME_FS" in
+            ext4)
+                run_cmd mkfs.ext4 -F "$home_partition"
+                ;;
+            ext3)
+                run_cmd mkfs.ext3 -F "$home_partition"
+                ;;
+            ext2)
+                run_cmd mkfs.ext2 -F "$home_partition"
+                ;;
+            btrfs)
+                run_cmd mkfs.btrfs -f "$home_partition"
+                ;;
+            *)
+                die "Unsupported home filesystem for formatting: $DEFAULT_HOME_FS" 43
+                ;;
+        esac
+    fi
 }
 
-[ -z "${language}" ]         && { echo "Missing language";          exit 42; }
-[ -z "${user_name}" ]        && { echo "Missing user name";         exit 42; }
-[ -z "${user_password}" ]    && { echo "Missing password";          exit 42; }
-[ -z "${squashfs_file}" ]    && { echo "Missing system image file"; exit 42; }
-[ -z "${hostname}" ]         && { echo "Missing hostname";          exit 42; }
-[ -z "${timezone}" ]         && { echo "Missing time zone";         exit 42; }
-[ -z "${keyboard_map}" ]     && { echo "Missing keyboard map";      exit 42; }
 
-log "Setting up partition tables"
-partx -u  "/dev/$(lsblk -no PKNAME ${target_partition})"
-partprobe "/dev/$(lsblk -no PKNAME ${target_partition})"
+# =============================================================================
+# 10. Mount target, home, and EFI
+# =============================================================================
 
-partx -u  "/dev/$(lsblk -no PKNAME ${efi_partition})"
-partprobe "/dev/$(lsblk -no PKNAME ${efi_partition})"
+mount_install_targets() {
+    log "Ensuring selected partitions are unmounted before installation..."
 
-[ -b "/${home_partition}" ] && {
-  partx -u  "/dev/$(lsblk -no PKNAME ${home_partition})"
-  partprobe "/dev/$(lsblk -no PKNAME ${home_partition})"
+    umount_device_everywhere "$target_partition"
+
+    if [[ -n "$home_partition" ]]; then
+        umount_device_everywhere "$home_partition"
+    fi
+
+    if [[ -n "$efi_partition" ]]; then
+        umount_device_everywhere "$efi_partition"
+    fi
+
+    umount_if_mounted_target_path "$TARGET_MNT/home"
+    umount_if_mounted_target_path "$TARGET_MNT/boot/efi"
+    umount_if_mounted_target_path "$TARGET_MNT"
+
+    log "Mounting root target partition to $TARGET_MNT..."
+    run_cmd mkdir -p "$TARGET_MNT"
+    run_cmd mount -o rw "$target_partition" "$TARGET_MNT"
+
+    if [[ -n "$home_partition" ]]; then
+        log "Mounting home partition to $TARGET_MNT/home..."
+        run_cmd mkdir -p "$TARGET_MNT/home"
+        run_cmd mount -o rw "$home_partition" "$TARGET_MNT/home"
+    fi
+
+    if is_efi_booted; then
+        log "Mounting EFI partition to $TARGET_MNT/boot/efi..."
+        run_cmd mkdir -p "$TARGET_MNT/boot/efi"
+        run_cmd mount -o rw "$efi_partition" "$TARGET_MNT/boot/efi"
+    fi
 }
 
-install_system "${@}"
+
+# =============================================================================
+# 11. Extract filesystem
+# =============================================================================
+
+extract_system() {
+    log "Extracting system payload..."
+    log "Source: $squashfs_file"
+    log "Target: $TARGET_MNT"
+
+    run_cmd unsquashfs -f -d "$TARGET_MNT" "$squashfs_file"
+
+    [[ -d "$TARGET_MNT/etc" ]] || die "Extraction finished, but $TARGET_MNT/etc does not exist. Bad payload?" 44
+}
+
+
+# =============================================================================
+# 12. Generate fstab using UUID
+# =============================================================================
+
+generate_fstab() {
+    log "Generating UUID-based fstab..."
+
+    local root_uuid
+    local root_type
+    local home_uuid
+    local home_type
+    local efi_uuid
+    local efi_type
+
+    root_uuid="$(blkid -s UUID -o value "$target_partition")"
+    root_type="$(blkid -s TYPE -o value "$target_partition")"
+
+    [[ -n "$root_uuid" ]] || die "Could not get UUID for root partition: $target_partition" 45
+    [[ -n "$root_type" ]] || die "Could not get filesystem type for root partition: $target_partition" 45
+
+    cat > "$TARGET_MNT/etc/fstab" <<EOF
+# /etc/fstab generated by LinStaller ALPHA
+UUID=$root_uuid / $root_type defaults 0 1
+EOF
+
+    if [[ -n "$home_partition" ]]; then
+        home_uuid="$(blkid -s UUID -o value "$home_partition")"
+        home_type="$(blkid -s TYPE -o value "$home_partition")"
+
+        [[ -n "$home_uuid" ]] || die "Could not get UUID for home partition: $home_partition" 45
+        [[ -n "$home_type" ]] || die "Could not get filesystem type for home partition: $home_partition" 45
+
+        echo "UUID=$home_uuid /home $home_type defaults 0 2" >> "$TARGET_MNT/etc/fstab"
+    fi
+
+    if is_efi_booted; then
+        efi_uuid="$(blkid -s UUID -o value "$efi_partition")"
+        efi_type="$(blkid -s TYPE -o value "$efi_partition")"
+
+        [[ -n "$efi_uuid" ]] || die "Could not get UUID for EFI partition: $efi_partition" 45
+        [[ -n "$efi_type" ]] || efi_type="vfat"
+
+        echo "UUID=$efi_uuid /boot/efi $efi_type umask=0077 0 1" >> "$TARGET_MNT/etc/fstab"
+    fi
+
+    log "Generated fstab:"
+    cat "$TARGET_MNT/etc/fstab" >> "$MESSAGE_FILE"
+}
+
+
+# =============================================================================
+# 13. Prepare chroot mounts
+# =============================================================================
+
+prepare_chroot() {
+    log "Preparing chroot bind mounts..."
+
+    run_cmd mkdir -p "$TARGET_MNT/proc" "$TARGET_MNT/sys" "$TARGET_MNT/dev" "$TARGET_MNT/run" "$TARGET_MNT/tmp"
+
+    run_cmd chmod 1777 "$TARGET_MNT/tmp"
+
+    run_cmd mount --rbind /proc "$TARGET_MNT/proc"
+    run_cmd mount --make-rslave "$TARGET_MNT/proc"
+
+    run_cmd mount --rbind /sys "$TARGET_MNT/sys"
+    run_cmd mount --make-rslave "$TARGET_MNT/sys"
+
+    run_cmd mount --rbind /dev "$TARGET_MNT/dev"
+    run_cmd mount --make-rslave "$TARGET_MNT/dev"
+
+    run_cmd mount --rbind /run "$TARGET_MNT/run"
+    run_cmd mount --make-rslave "$TARGET_MNT/run"
+}
+
+
+# =============================================================================
+# 14. Configure installed system
+# =============================================================================
+
+configure_locale_keyboard_timezone_hostname() {
+    log "Setting locale..."
+    run_cmd mkdir -p "$TARGET_MNT/etc/default"
+
+    cat > "$TARGET_MNT/etc/default/locale" <<EOF
+LANG=${language}.UTF-8
+LC_ALL=${language}.UTF-8
+EOF
+
+    log "Setting keyboard..."
+    echo "KEYMAP=${keyboard_map}" > "$TARGET_MNT/etc/vconsole.conf"
+
+    if [[ -d "$TARGET_MNT/etc/default" ]]; then
+        cat > "$TARGET_MNT/etc/default/keyboard" <<EOF
+XKBMODEL="pc105"
+XKBLAYOUT="${keyboard_map}"
+XKBVARIANT=""
+XKBOPTIONS=""
+BACKSPACE="guess"
+EOF
+    fi
+
+    log "Setting timezone..."
+    if [[ -f "$TARGET_MNT/usr/share/zoneinfo/$timezone" ]]; then
+        run_cmd ln -sf "/usr/share/zoneinfo/$timezone" "$TARGET_MNT/etc/localtime"
+    else
+        log "WARNING: timezone file not found in target: /usr/share/zoneinfo/$timezone"
+    fi
+
+    echo "$timezone" > "$TARGET_MNT/etc/timezone"
+
+    log "Setting hostname..."
+    echo "$hostname" > "$TARGET_MNT/etc/hostname"
+
+    if [[ -f "$TARGET_MNT/etc/hosts" ]]; then
+        if ! grep -q "127.0.1.1" "$TARGET_MNT/etc/hosts"; then
+            echo "127.0.1.1 $hostname" >> "$TARGET_MNT/etc/hosts"
+        fi
+    else
+        cat > "$TARGET_MNT/etc/hosts" <<EOF
+127.0.0.1 localhost
+127.0.1.1 $hostname
+EOF
+    fi
+}
+
+
+# =============================================================================
+# 15. Create user
+# =============================================================================
+
+read_user_password() {
+    if [[ -n "$user_password_file" ]]; then
+        [[ -f "$user_password_file" ]] || die "Password file not found: $user_password_file" 46
+        user_password="$(head -n1 "$user_password_file")"
+    fi
+
+    [[ -n "$user_password" ]] || die "User password is empty." 46
+}
+
+setup_user() {
+    log "Setting up user: $user_name"
+
+    read_user_password
+
+    if chroot "$TARGET_MNT" id -u "$user_name" >/dev/null 2>&1; then
+        log "User already exists in target: $user_name"
+    else
+        run_cmd chroot "$TARGET_MNT" useradd -m -s /bin/bash "$user_name"
+    fi
+
+    if chroot "$TARGET_MNT" getent group sudo >/dev/null 2>&1; then
+        run_cmd chroot "$TARGET_MNT" usermod -aG sudo "$user_name"
+    elif chroot "$TARGET_MNT" getent group wheel >/dev/null 2>&1; then
+        run_cmd chroot "$TARGET_MNT" usermod -aG wheel "$user_name"
+    else
+        log "WARNING: no sudo or wheel group found in target."
+    fi
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+        log "DRY RUN: would set password for $user_name"
+    else
+        printf '%s:%s\n' "$user_name" "$user_password" | chroot "$TARGET_MNT" chpasswd >> "$MESSAGE_FILE" 2>&1 || {
+            die "Failed to set password for user: $user_name" 47
+        }
+    fi
+}
+
+
+# =============================================================================
+# 16. Install GRUB
+# =============================================================================
+
+install_grub() {
+    log "Installing GRUB..."
+
+    if is_efi_booted; then
+        log "EFI boot mode detected."
+
+        [[ -d "$TARGET_MNT/boot/efi" ]] || die "EFI mount directory missing: $TARGET_MNT/boot/efi" 48
+
+        run_cmd chroot "$TARGET_MNT" grub-install \
+            --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=GRUB \
+            --recheck
+
+        # Removable fallback is useful on USB and some firmware/VMs.
+        run_cmd chroot "$TARGET_MNT" grub-install \
+            --target=x86_64-efi \
+            --efi-directory=/boot/efi \
+            --bootloader-id=GRUB \
+            --removable \
+            --recheck
+    else
+        log "Legacy BIOS mode detected."
+
+        run_cmd chroot "$TARGET_MNT" grub-install \
+            --target=i386-pc \
+            --recheck \
+            "$target_disk"
+    fi
+
+    log "Updating GRUB..."
+    if chroot "$TARGET_MNT" command -v update-grub >/dev/null 2>&1; then
+        run_cmd chroot "$TARGET_MNT" update-grub
+    elif chroot "$TARGET_MNT" command -v grub-mkconfig >/dev/null 2>&1; then
+        run_cmd chroot "$TARGET_MNT" grub-mkconfig -o /boot/grub/grub.cfg
+    else
+        die "Neither update-grub nor grub-mkconfig found in target system." 49
+    fi
+}
+
+
+# =============================================================================
+# 17. Update initramfs if available
+# =============================================================================
+
+update_initramfs_if_available() {
+    log "Updating initramfs if tool exists..."
+
+    if chroot "$TARGET_MNT" command -v update-initramfs >/dev/null 2>&1; then
+        run_cmd chroot "$TARGET_MNT" update-initramfs -u -k all
+    elif chroot "$TARGET_MNT" command -v dracut >/dev/null 2>&1; then
+        run_cmd chroot "$TARGET_MNT" dracut --regenerate-all --force
+    else
+        log "No initramfs update tool found. Skipping."
+    fi
+}
+
+
+# =============================================================================
+# 18. Optional post-install
+# =============================================================================
+
+run_post_install_if_available() {
+    log "Checking for post-install script..."
+
+    if [[ -x "$TARGET_MNT/usr/bin/post-install" ]]; then
+        log "Running target post-install..."
+        run_cmd chroot "$TARGET_MNT" /usr/bin/post-install
+    else
+        log "No executable /usr/bin/post-install found. Skipping."
+    fi
+}
+
+
+# =============================================================================
+# 19. Main install flow
+# =============================================================================
+
+install_system() {
+    log "============================================================"
+    log "LinStaller ALPHA installation started: $(date)"
+    log "Target partition: $target_partition"
+    log "Target disk:      $target_disk"
+    log "EFI partition:    ${efi_partition:-none}"
+    log "Home partition:   ${home_partition:-none}"
+    log "SquashFS file:    $squashfs_file"
+    log "Hostname:         $hostname"
+    log "User:             $user_name"
+    log "Timezone:         $timezone"
+    log "Language:         $language"
+    log "Keyboard:         $keyboard_map"
+    log "Format target:    $FORMAT_TARGET"
+    log "Format home:      $FORMAT_HOME"
+    log "Dry run:          $DRY_RUN"
+    log "============================================================"
+
+    validate_required_values
+    validate_not_current_root
+    validate_target_disk_parent
+    validate_space_hint
+
+    refresh_partition_table
+    format_partitions_if_requested
+    mount_install_targets
+    extract_system
+    generate_fstab
+    prepare_chroot
+    configure_locale_keyboard_timezone_hostname
+    setup_user
+    update_initramfs_if_available
+    install_grub
+    run_post_install_if_available
+
+    log "============================================================"
+    log "LinStaller ALPHA installation finished successfully."
+    log "Installed target: $target_partition"
+    log "You may reboot after reviewing logs."
+    log "============================================================"
+
+    exit 0
+}
+
+
+# =============================================================================
+# 20. Run
+# =============================================================================
+
+parse_args "$@"
+install_system "$@"
