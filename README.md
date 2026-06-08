@@ -1,4 +1,6 @@
-# ALPHA CONCEPT WARNING - Heavy Update June 08, 2026
+# ALPHA CONCEPT WARNING - Heavy Update from original script on June 08, 2026
+
+Original Script is here: https://github.com/offternet/linstaller/tree/main
 
 This repository contains experimental installer design code. It is not production ready. Do not run this on daily-use systems, production systems, or machines containing important data.
 
@@ -55,22 +57,80 @@ This will **erase all partitions and data** on `/dev/sda` create a 512M partitio
 
 The script supports various arguments to specify installation settings. Here are the supported arguments:
 
-* `--target-partition=<target_partition>`: Specifies the target partition where the system will be installed.`*`
-* `--home-partition=<home_partition>`: Specifies the user's home partition.
-* `--user-name=<user_name>`: Specifies the name of the user to be created during installation.`*`
-* `--user-password=<user_password>`: Specifies the user's password.`*`
-* `--squashfs=<squashfs_file>`: Specifies the SquashFS file containing the system image to be installed.`*`
-* `--hostname=<host_name>`: Specifies the hostname for the system.`*`
-* `--timezone=<timezone>`: Specifies the system's timezone.`*`
-* `--keyboard-map=<keyboard_layout>`: Specifies the keyboard layout.`*`
-* `--target-disk=<target_disk>`: Specifies the target disk where Grub will be installed.`*`
-* `--efi-partition=<efi_partition>`: Specifies the EFI partition (required if the system is being installed on a UEFI system).`**`
-* `--language=<language>`: Specifies the system language.`*`
 
-> **Notes:**
-> * `*` Mandatory
-> * `**` Mandatory if the system is booted in UEFI mode.
-> * See [linstaller-example](linstaller-example) for usage example
+
+## Usage
+
+The script supports the following arguments to specify installation settings.
+
+### Required arguments
+
+* `--target-partition=<target_partition>`
+Specifies the target partition where the system will be installed.
+
+* `--target-disk=<target_disk>`
+Specifies the target disk where GRUB will be installed.
+
+* `--squashfs=<squashfs_file>`
+Specifies the SquashFS file containing the system image to be installed.
+
+* `--user-name=<user_name>`
+Specifies the name of the user to be created during installation.
+
+* `--user-password=<user_password>`
+Specifies the user's password.
+
+* `--hostname=<host_name>`
+Specifies the hostname for the installed system.
+
+* `--timezone=<timezone>`
+Specifies the system timezone.
+
+* `--keyboard-map=<keyboard_layout>`
+Specifies the keyboard layout.
+
+* `--language=<language>`
+Specifies the system language.
+
+* `--i-understand-this-erases-target`
+Required safety confirmation. The script will refuse to continue without this flag.
+
+### Conditionally required arguments
+
+* `--efi-partition=<efi_partition>`
+Specifies the EFI partition. Required when the installer is running on a UEFI-booted system.
+
+### Optional arguments
+
+* `--home-partition=<home_partition>`
+Specifies a separate user home partition.
+
+* `--user-password-file=<password_file>`
+Reads the user's password from a local file instead of passing the password directly on the command line. This is safer than `--user-password`.
+
+* `--format-target`
+Formats the target partition before installation.
+
+* `--format-home`
+Formats the home partition before installation. Only applies when `--home-partition` is used.
+
+* `--target-fs=<filesystem>`
+Specifies the filesystem to use when formatting the target partition. Default is `ext4`.
+
+* `--home-fs=<filesystem>`
+Specifies the filesystem to use when formatting the home partition. Default is `ext4`.
+
+* `--config=<config_file>`
+Loads installation settings from a local configuration file.
+
+* `--skip-umount`
+Prevents automatic cleanup unmounts at script exit. Useful only for debugging.
+
+* `--dry-run`
+Prints the actions that would be performed without actually running destructive commands.
+
+* `--help`
+Displays usage information.
 
 ## How does it work?
 The script performs the following steps during installation:
