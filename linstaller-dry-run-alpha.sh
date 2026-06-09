@@ -1,0 +1,13 @@
+sudo ./linstaller-alpha.sh \
+  --target-partition=/dev/sda9 \
+  --target-disk=/dev/sda \
+  --squashfs=/home/linux/filesystem.squashfs \
+  --user-name=linux \
+  --user-password='password' \
+  --hostname=linstaller-test \
+  --timezone=America/Phoenix \
+  --language=en_US \
+  --keyboard-map=us \
+  --format-target \
+  --i-understand-this-erases-target \
+  --dry-run
